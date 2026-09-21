@@ -1,5 +1,6 @@
 import { spawn, ChildProcessWithoutNullStreams } from "child_process";
 import path from "path";
+import fs from "fs";
 import readline from "readline";
 import {
   startCrawl,
@@ -15,6 +16,12 @@ const CRAWLER_DIR = path.join(process.cwd(), "crawler");
 // this matches the layout used everywhere else in this project.
 const PYTHON_PATH = process.env.CRAWLER_PYTHON_PATH || path.join(CRAWLER_DIR, "venv", "Scripts", "python.exe");
 const SCRIPT_PATH = path.join(CRAWLER_DIR, "crawler.py");
+// Must match STOP_FLAG_NAME in crawler/crawler.py.
+const STOP_FLAG_NAME = ".stop_requested";
+// How long to wait for the crawler to notice the flag, finish its current
+// file, and exit on its own before giving up and hard-killing it anyway —
+// a safety net, not the normal path.
+const GRACEFUL_STOP_TIMEOUT_MS = 60_000;
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -23,6 +30,14 @@ function requireEnv(name: string): string {
 }
 
 let currentChild: ChildProcessWithoutNullStreams | null = null;
+// Resolves once the currently-running child has actually exited (any way —
+// clean finish, graceful stop, or killed) — lets stopCrawl() wait for a
+// real graceful exit before falling back to a hard kill, instead of just
+// firing kill() immediately.
+let currentChildExited: Promise<void> | null = null;
+// So stopCrawl() knows where to write the stop-flag file without needing
+// its own copy of requireEnv("POOL_DIR") — set right before each spawn.
+let currentPoolDir: string | null = null;
 
 // Matches: [123] copied name.ext (0.05 GB) bytes=54321
 // The greedy name-capture correctly handles filenames that themselves
@@ -42,6 +57,10 @@ function runPython(args: string[]): Promise<{ code: number | null; stdout: strin
   return new Promise((resolve, reject) => {
     const child = spawn(/* turbopackIgnore: true */ PYTHON_PATH, [SCRIPT_PATH, ...args], { cwd: CRAWLER_DIR });
     currentChild = child;
+    let resolveExited: () => void;
+    currentChildExited = new Promise((r) => {
+      resolveExited = r;
+    });
     let stdoutBuf = "";
     let stderrBuf = "";
 
@@ -59,11 +78,13 @@ function runPython(args: string[]): Promise<{ code: number | null; stdout: strin
 
     child.on("error", (err) => {
       currentChild = null;
+      resolveExited();
       reject(err);
     });
 
     child.on("close", (code) => {
       currentChild = null;
+      resolveExited();
       resolve({ code, stdout: stdoutBuf, stderr: stderrBuf });
     });
   });
@@ -85,6 +106,7 @@ export async function runCrawlInBackground(): Promise<void> {
   try {
     const sourceDir = requireEnv("SOURCE_DIR");
     const poolDir = requireEnv("POOL_DIR");
+    currentPoolDir = poolDir;
 
     const copyResult = await runPython(["--source", sourceDir, "--pool", poolDir, "--skip-disk-check"]);
     if (isCrawlStopRequested()) return finishCrawl("stopped");
@@ -99,13 +121,46 @@ export async function runCrawlInBackground(): Promise<void> {
   }
 }
 
-export function stopCrawl(): void {
+// Graceful by default: writes a flag file the crawler checks between files
+// (crawler.py's stop_requested()) so it can finish its current file, save
+// the mapping, and exit cleanly — instead of the old behavior of an
+// immediate hard kill, which on Windows gives the crawler zero chance to
+// run any of its own cleanup code (Node's child.kill() maps straight to
+// TerminateProcess there; confirmed data loss risk, not just theoretical —
+// see the mapping/pool-folder mismatch this replaced). Hard-kill is now
+// only a last-resort fallback if the crawler doesn't exit on its own
+// within GRACEFUL_STOP_TIMEOUT_MS.
+export async function stopCrawl(): Promise<void> {
   requestCrawlStop();
-  if (currentChild) {
-    // Hard-terminate — Windows has no real signal delivery to a subprocess,
-    // so this is the same as a crash. The crawler is already checkpointed
-    // and proven safe to resume after abrupt termination (verified at
-    // 20,000 files with zero data loss or duplication).
+  if (!currentChild) return;
+
+  if (!currentPoolDir) {
+    // No pool dir on record to write the flag into — shouldn't normally
+    // happen, but a stop request must still do *something*.
+    currentChild.kill();
+    return;
+  }
+
+  try {
+    fs.writeFileSync(path.join(currentPoolDir, STOP_FLAG_NAME), "");
+  } catch (err) {
+    console.error("[crawlEngine] failed to write stop flag, falling back to hard kill:", err);
+    currentChild.kill();
+    return;
+  }
+
+  const exited = currentChildExited;
+  if (!exited) return;
+
+  const timedOut = await Promise.race([
+    exited.then(() => false),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(true), GRACEFUL_STOP_TIMEOUT_MS)),
+  ]);
+
+  if (timedOut && currentChild) {
+    console.error(
+      `[crawlEngine] crawler did not exit within ${GRACEFUL_STOP_TIMEOUT_MS}ms of stop request — hard-killing`
+    );
     currentChild.kill();
   }
 }

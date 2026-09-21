@@ -22,6 +22,7 @@ import config
 import mapping as mapping_mod
 
 ERROR_LOG = "errors.log"
+STOP_FLAG_NAME = ".stop_requested"  # graceful-stop signal file, see stop_requested() below
 SAVE_EVERY = 10  # checkpoint interval — how many copied files between mapping saves / progress prints
 # Deliberately low: on Windows, the app's Stop button hard-kills this
 # process (Node's child.kill() maps to TerminateProcess on Windows, giving
@@ -55,6 +56,21 @@ def to_long_path(path_str: str) -> str:
     if path_str.startswith("\\\\"):
         return "\\\\?\\UNC\\" + path_str[2:]
     return "\\\\?\\" + path_str
+
+
+def stop_requested(pool_dir: Path) -> bool:
+    """Graceful-stop signal, checked once per file in the main copy loop.
+
+    On Windows the app's Stop button can't send a real signal a Python
+    process can catch (Node's child.kill() is a hard TerminateProcess with
+    zero chance to run cleanup code) — a plain flag file is a simple,
+    reliable, cross-platform way to ask this process to finish its current
+    file, save the mapping, and exit cleanly instead of being killed
+    mid-write. Node writes the file to request a stop and waits (with a
+    timeout) for this process to exit on its own before falling back to a
+    hard kill.
+    """
+    return (pool_dir / STOP_FLAG_NAME).exists()
 
 
 def log_error(path: str, reason: str) -> None:
@@ -225,6 +241,12 @@ def initial_crawl(source_dir: str, pool_dir: Path) -> None:
 
     pool_dir.mkdir(parents=True, exist_ok=True)
 
+    # Clear any stale flag from a previous run so a fresh run doesn't
+    # immediately think it's been asked to stop before it even starts.
+    stop_flag_path = pool_dir / STOP_FLAG_NAME
+    if stop_flag_path.exists():
+        stop_flag_path.unlink()
+
     already_done = len(mapping)
     bytes_already_done = sum(rec.get("size_bytes", 0) for rec in mapping.values())
     if already_done:
@@ -252,6 +274,11 @@ def initial_crawl(source_dir: str, pool_dir: Path) -> None:
     try:
         try:
             for source_path in walk_source(source_dir):
+                if stop_requested(pool_dir):
+                    interrupted = True
+                    print("\nStop requested — saving checkpoint and exiting cleanly.")
+                    break
+
                 candidate_original_path = relative_original_path(source_path, source_dir)
 
                 if mapping_mod.is_already_copied(source_index, candidate_original_path):
