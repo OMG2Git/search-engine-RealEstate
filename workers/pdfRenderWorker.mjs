@@ -16,6 +16,16 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pathToFileURL(workerPath).href;
 const standardFontDataUrl = pathToFileURL(
   path.join(process.cwd(), "node_modules", "pdfjs-dist", "standard_fonts") + path.sep
 ).href;
+// Recent pdfjs-dist versions moved JBIG2/JPEG2000 decoding into WASM
+// modules loaded from this directory. Without it, both the WASM path AND
+// its JS fallback fail (the fallback has a bug building its module path by
+// string concatenation, producing a literal "null..." prefix) — pages
+// using JBIG2 compression (very common in old scanned black-and-white
+// documents) then silently have that image content dropped instead of
+// rendered, degrading summary quality without ever throwing an error.
+const wasmUrl = pathToFileURL(
+  path.join(process.cwd(), "node_modules", "pdfjs-dist", "wasm") + path.sep
+).href;
 
 // Renders pages [startPage, endPage] (1-indexed, inclusive) — not always
 // "the first N pages". Large documents get split into multiple chunks
@@ -23,7 +33,7 @@ const standardFontDataUrl = pathToFileURL(
 // seen instead of silently truncating a big file to just its opening pages.
 async function renderJob(filePath, startPage, endPage, maxImageBytes) {
   const bytes = fs.readFileSync(filePath);
-  const doc = await pdfjsLib.getDocument({ data: new Uint8Array(bytes), standardFontDataUrl }).promise;
+  const doc = await pdfjsLib.getDocument({ data: new Uint8Array(bytes), standardFontDataUrl, wasmUrl }).promise;
   const totalPages = doc.numPages;
   const lastPage = Math.min(endPage, totalPages);
 
