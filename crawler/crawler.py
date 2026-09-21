@@ -22,7 +22,15 @@ import config
 import mapping as mapping_mod
 
 ERROR_LOG = "errors.log"
-SAVE_EVERY = 50  # checkpoint interval — how many copied files between mapping saves / progress prints
+SAVE_EVERY = 10  # checkpoint interval — how many copied files between mapping saves / progress prints
+# Deliberately low: on Windows, the app's Stop button hard-kills this
+# process (Node's child.kill() maps to TerminateProcess on Windows, giving
+# this code zero chance to run its own cleanup/finally block). The mapping
+# only ever gets saved at a checkpoint or a clean finish, so this interval
+# is the real ceiling on how many already-copied files could go unrecorded
+# if Stop is pressed mid-run. Lower = less to lose per hard-kill, at the
+# cost of rewriting the whole mapping file more often — 10 is a reasonable
+# balance for a run with hundreds of thousands of files.
 MAX_STEM_LEN = 180 - 40  # leave room for "__<hash>" + extension
 
 
