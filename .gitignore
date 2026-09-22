@@ -51,3 +51,6 @@ crawler/*.json
 # GCP credentials — never commit these
 service-account.json
 *-service-account.json
+
+# session logs (instrumentation.ts) -- real archive content, never committed
+/logs/
