@@ -86,6 +86,14 @@ export function parseJsonResponse(text: string): SummaryResult {
   } catch {
     parsed = JSON.parse(repairInnerQuotes(cleaned));
   }
+  // The model sometimes wraps its object in a top-level array —
+  // `[{"summary": ..., "keywords": [...]}]` instead of the requested plain
+  // object. parsed.summary on an array is undefined, which fell straight
+  // into the "no summary" branch below and discarded a perfectly good
+  // summary that was sitting right there in parsed[0] — confirmed for real
+  // by seeing actual, coherent summary text in the logged raw response of
+  // files marked "failed" this way. Unwrap it before checking.
+  if (Array.isArray(parsed)) parsed = parsed[0] ?? {};
   const summary = typeof parsed.summary === "string" ? parsed.summary : "";
   const keywords = Array.isArray(parsed.keywords)
     ? parsed.keywords.map((k: unknown) => String(k).toLowerCase())
