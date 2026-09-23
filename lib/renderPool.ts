@@ -33,10 +33,17 @@ const DEFAULT_POOL_SIZE = Math.max(2, Math.min(SYNC_CONCURRENCY, os.cpus().lengt
 const POOL_SIZE = Number(process.env.RENDER_POOL_SIZE) || DEFAULT_POOL_SIZE;
 const WORKER_PATH = path.join(process.cwd(), "workers", "pdfRenderWorker.mjs");
 
-// Generous on purpose — even a 40-page render should finish in seconds, but
-// a truly pathological file (or one hitting an obscure pdfjs-dist bug)
-// should still be cut loose well before it can stall a multi-day run.
-const RENDER_TIMEOUT_MS = 90_000;
+// Was 90s on the assumption a 40-page render "should finish in seconds" —
+// real overnight data disproved that: 33 real failures tonight were
+// "Rendering timed out", and 28 of those were completely normal-sized
+// files (3-11MB, not the huge/corrupted ones the timeout was meant to
+// catch). Under real load — 16 files summarizing concurrently, each
+// competing for the render pool's limited worker threads/CPU cores — wall
+// clock time for a real multi-page scanned chunk is genuinely often over
+// 90s without anything being wrong with the file. Raised to give real
+// files enough room; a truly pathological file still gets cut loose
+// eventually rather than hanging forever.
+const RENDER_TIMEOUT_MS = 180_000;
 
 interface RenderResult {
   totalPages: number;
@@ -81,20 +88,31 @@ function spawnWorker(): PoolWorker {
   const worker = new Worker(WORKER_PATH);
   const entry: PoolWorker = { worker, busy: false, currentJobId: null };
 
-  worker.on("message", (msg: { id: string; ok: boolean; totalPages?: number; pagesSent?: number; buffers?: ArrayBuffer[]; error?: string }) => {
-    if (msg.ok) {
-      settleJob(msg.id, null, {
-        totalPages: msg.totalPages!,
-        pagesSent: msg.pagesSent!,
-        pages: (msg.buffers ?? []).map((b) => Buffer.from(b)),
-      });
-    } else {
-      settleJob(msg.id, new Error(msg.error));
+  worker.on(
+    "message",
+    (msg: { id: string; ok: boolean; filePath?: string; totalPages?: number; pagesSent?: number; buffers?: ArrayBuffer[]; warnings?: string[]; error?: string }) => {
+      if (msg.ok) {
+        // pdfjs warnings (missing cMap/wasm/font data for a specific
+        // embedded font, etc.) don't fail the render — the page "succeeds"
+        // with that content silently missing. Logging them here, tagged
+        // with the actual file, is what makes an affected file findable
+        // later: `grep "rendering warnings for" logs/<date>.log`.
+        if (msg.warnings && msg.warnings.length > 0) {
+          console.error(`[renderPool] rendering warnings for "${msg.filePath}": ${msg.warnings.join(" | ")}`);
+        }
+        settleJob(msg.id, null, {
+          totalPages: msg.totalPages!,
+          pagesSent: msg.pagesSent!,
+          pages: (msg.buffers ?? []).map((b) => Buffer.from(b)),
+        });
+      } else {
+        settleJob(msg.id, new Error(msg.error));
+      }
+      entry.busy = false;
+      entry.currentJobId = null;
+      dispatchNext();
     }
-    entry.busy = false;
-    entry.currentJobId = null;
-    dispatchNext();
-  });
+  );
 
   worker.on("error", (err) => {
     console.error("[renderPool] worker error, replacing it:", err);

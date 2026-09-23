@@ -27,7 +27,13 @@ const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 // and was rejected). Stay well under that — this is the size of ONE chunk,
 // not the whole document; documents longer than this are split into
 // multiple chunks (see summariseViaOpenRouterInner) rather than truncated.
-const MAX_OPENROUTER_PAGES = 40;
+// Lowered from 40: real overnight data showed normal-sized (3-11MB) files
+// still hitting the render timeout under real 16-way concurrent load —
+// rendering fewer pages per chunk means less wall-clock work per render
+// job, directly reducing how often a legitimately fine file gets cut loose
+// as "timed out". Costs more OpenRouter calls for large documents (more
+// chunks), an acceptable tradeoff for overnight reliability.
+const MAX_OPENROUTER_PAGES = 20;
 const MAX_OPENROUTER_IMAGE_BYTES = 20 * 1024 * 1024; // stay under the 30MB cap with margin
 
 // Real testing confirmed simply capping at MAX_OPENROUTER_PAGES silently
@@ -59,7 +65,12 @@ const CHUNK_CONCURRENCY = 1;
 const MAX_ATTEMPTS = 5;
 const BASE_BACKOFF_MS = 2000;
 const MAX_BACKOFF_MS = 30_000;
-const NON_RETRYABLE_STATUS = new Set([400, 401, 403, 404]);
+// 402 (Payment Required) added deliberately: OpenRouter returns this when
+// the key's spending limit is reached. It's not transient like a 429 or a
+// 5xx — retrying it burns through MAX_ATTEMPTS of exponential backoff
+// (confirmed: ~60s wasted per file) only to fail identically every time
+// until the limit is raised or credit is added.
+const NON_RETRYABLE_STATUS = new Set([400, 401, 402, 403, 404]);
 
 // Hard ceilings so a single messy real-world file can never hang the whole
 // pipeline — every promise this module returns is guaranteed to eventually

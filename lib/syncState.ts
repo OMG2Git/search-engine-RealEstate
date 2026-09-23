@@ -39,6 +39,23 @@ export function isSyncRunning(): boolean {
   return state.running;
 }
 
+// Atomically checks-and-sets "running" in one synchronous step — this is
+// what actually prevents two overlapping sync runs, not a separate
+// isSyncRunning() check followed later by startSync(). The previous code
+// checked isSyncRunning() synchronously but didn't set state.running until
+// after `await planSync(...)` (a real Firestore round-trip) — during that
+// gap, a second call's isSyncRunning() check also saw `false` and slipped
+// through, both then building an overlapping batch from the same stale
+// "unprocessed" list. Confirmed as the real cause of real files
+// (10038.pdf, 10039.pdf, 10-10-2013.pdf, IMG_0025.JPG, IMG_0028.JPG) each
+// getting processed — and billed for — twice. Since this function has no
+// await, there's no gap for another call to interleave in.
+export function claimSyncRun(): boolean {
+  if (state.running) return false;
+  state.running = true;
+  return true;
+}
+
 export function isStopRequested(): boolean {
   return state.stopRequested;
 }

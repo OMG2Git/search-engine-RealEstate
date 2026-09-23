@@ -1,5 +1,6 @@
 import fs from "fs";
 import path from "path";
+import crypto from "crypto";
 import { GoogleGenAI } from "@google/genai";
 import mammoth from "mammoth";
 import * as XLSX from "xlsx";
@@ -89,6 +90,18 @@ export function parseJsonResponse(text: string): SummaryResult {
   const keywords = Array.isArray(parsed.keywords)
     ? parsed.keywords.map((k: unknown) => String(k).toLowerCase())
     : [];
+  if (!summary.trim()) {
+    // A missing/empty summary field usually means the model didn't return
+    // the requested JSON shape at all — e.g. a content-safety refusal on a
+    // personal ID document (PAN/Aadhaar scans) comes back as prose or an
+    // empty field instead of {"summary": ...}. Silently accepting "" here
+    // let a file be marked "done" with no searchable content and no visible
+    // error (confirmed: a real archive file did exactly this). Throwing
+    // lets the caller's retry loop have another attempt, and if it never
+    // succeeds, the file correctly ends up "failed" instead of silently
+    // blank.
+    throw new Error(`Model returned no summary text (raw response: ${cleaned.slice(0, 300)})`);
+  }
   return { summary, keywords };
 }
 
@@ -181,12 +194,31 @@ async function trimPdfForInline(bytes: Buffer): Promise<Buffer | null> {
 // Returns null for a genuinely corrupt/unreadable file rather than throwing,
 // so one bad image degrades to a fallback summary instead of failing the
 // whole sync attempt with no useful message.
+// OpenRouter rejects any request whose image content exceeds 30MB
+// (confirmed via a real 413 "Downloaded image content cannot exceed 30MB").
+// A lossless PNG re-encode of a full-resolution phone photo (many real
+// archive files) can balloon to 30-50MB+ despite a source JPEG of only a
+// few MB — the ORIGINAL file being under MAX_IMAGE_BYTES said nothing about
+// the PNG we were about to send. Capping the longest side keeps output
+// comfortably under that limit; vision models don't benefit from resolution
+// far beyond this anyway, so nothing a document-summarization task needs is
+// lost. Falls back to a smaller cap if a single resize still isn't enough
+// (a pathological image that doesn't compress well even downscaled).
+const IMAGE_RESIZE_STEPS = [3000, 1800, 1000];
+
 async function normaliseImageToPng(bytes: Buffer): Promise<Buffer | null> {
-  try {
-    return await sharp(bytes, { page: 0 }).png().toBuffer();
-  } catch {
-    return null;
+  for (const maxDim of IMAGE_RESIZE_STEPS) {
+    try {
+      const png = await sharp(bytes, { page: 0 })
+        .resize(maxDim, maxDim, { fit: "inside", withoutEnlargement: true })
+        .png()
+        .toBuffer();
+      if (png.length <= 25 * 1024 * 1024) return png;
+    } catch {
+      return null;
+    }
   }
+  return null;
 }
 
 const wordExtractor = new WordExtractor();
@@ -259,7 +291,19 @@ export async function summariseFile(
       // Write the normalized PNG next to the source so summariseViaOpenRouter
       // can read it the same way it reads a rasterized PDF page — avoids a
       // second code path just for "bytes already in memory".
-      const tmpPath = `${filePath}.__openrouter.png`;
+      //
+      // The temp name includes a random id per attempt — it used to be
+      // purely `${filePath}.__openrouter.png` (deterministic, same for
+      // every attempt at this file). If the same file was ever processed by
+      // two overlapping runs at once (e.g. two separate `npm run dev`
+      // processes, each with their own in-memory "is a sync already
+      // running" flag, unaware of each other), both computed the identical
+      // temp path, and whichever finished first deleted it out from under
+      // the other — confirmed as the real cause of a real
+      // "ENOENT ... unlink" crash on this exact line. A unique name per
+      // attempt makes that collision structurally impossible regardless of
+      // whether the underlying double-processing itself gets fixed.
+      const tmpPath = `${filePath}.${crypto.randomUUID()}.__openrouter.png`;
       fs.writeFileSync(tmpPath, png);
       try {
         return await summariseViaOpenRouter(tmpPath, false);

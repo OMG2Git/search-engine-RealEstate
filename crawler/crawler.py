@@ -112,10 +112,15 @@ def resolve_pool_name(original_name: str, source_path: str, taken_names: set) ->
 
 
 def copy_file(src: str, dest: Path) -> None:
-    """Copy to dest.part then rename, so a crash never leaves a half-file."""
+    """Copy to dest.part then rename, so a crash never leaves a half-file.
+    The rename retries transient Windows "Access is denied" failures (see
+    mapping.replace_with_retry) — real archive runs at high write volume hit
+    this regularly (54 files in one 8500-file run before this fix), each one
+    previously a silently-dropped file rather than an actually-copied one.
+    """
     part_path = dest.with_name(dest.name + ".part")
     shutil.copy2(to_long_path(src), to_long_path(str(part_path)))
-    os.replace(to_long_path(str(part_path)), to_long_path(str(dest)))
+    mapping_mod.replace_with_retry(to_long_path(str(part_path)), to_long_path(str(dest)))
 
 
 def relative_original_path(source_path: str, source_dir: str) -> str:
@@ -140,7 +145,35 @@ def process_one_file(source_path: str, source_dir: str, pool_dir: Path, mapping:
     original_name = os.path.basename(source_path)
     pool_name = resolve_pool_name(original_name, source_path, taken_names)
     dest = pool_dir / pool_name
-    copy_file(source_path, dest)
+    try:
+        copy_file(source_path, dest)
+    except Exception:
+        # Claim this name even though the copy failed. Without this, a
+        # DIFFERENT source file that happens to share the same original
+        # filename — very common in this archive, generic scan names like
+        # "pg.no.7.pdf" recur across dozens of unrelated folders — would
+        # resolve to this exact same pool name next and try to write
+        # through the exact same stuck .part file, failing identically.
+        # Confirmed as the real cause of a burst of repeated failures all
+        # sharing a handful of generic filenames across unrelated folders,
+        # not independent bad luck on 80+ different files. A later resume
+        # rebuilds taken_names from scratch (mapping.keys() only, since this
+        # file never made it into the mapping), so the original source file
+        # still gets to retry the plain name once whatever's blocking it
+        # clears.
+        taken_names.add(pool_name)
+        # Best-effort cleanup of the stray .part file: if this process's
+        # own half-written leftover is what's actually blocking later
+        # attempts (rather than an external lock), removing it stops it
+        # from also blocking every other same-named file for the rest of
+        # this run. If something else genuinely has it locked, this quietly
+        # fails too, which is fine — nothing worse happens either way.
+        part_path = dest.with_name(dest.name + ".part")
+        try:
+            os.remove(to_long_path(str(part_path)))
+        except OSError:
+            pass
+        raise
     record = build_record(source_path, original_name, source_dir)
     mapping_mod.add_entry(mapping, pool_name, record)
     taken_names.add(pool_name)
@@ -277,6 +310,10 @@ def initial_crawl(source_dir: str, pool_dir: Path) -> None:
                 if stop_requested(pool_dir):
                     interrupted = True
                     print("\nStop requested — saving checkpoint and exiting cleanly.")
+                    try:
+                        (pool_dir / STOP_FLAG_NAME).unlink()
+                    except OSError:
+                        pass
                     break
 
                 candidate_original_path = relative_original_path(source_path, source_dir)

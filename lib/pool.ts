@@ -61,5 +61,18 @@ export function listPoolFiles(): string[] {
   if (!POOL_DIR || !fs.existsSync(/* turbopackIgnore: true */ POOL_DIR)) return [];
   return fs
     .readdirSync(/* turbopackIgnore: true */ POOL_DIR)
-    .filter((name) => name !== "file_mapping.json" && !name.endsWith(".part") && !name.endsWith(".tmp"));
+    .filter(
+      (name) =>
+        name !== "file_mapping.json" &&
+        name !== ".stop_requested" &&
+        !name.endsWith(".part") &&
+        !name.endsWith(".tmp") &&
+        // Transient per-summarization temp file (see lib/gemini.ts's image
+        // handling) — written directly into the pool dir while OpenRouter
+        // summarizes an image, then deleted. A sync run's file listing can
+        // race against one that's mid-flight and briefly pick it up as if
+        // it were a real, unprocessed pool file (confirmed: 11 of these
+        // logged as "no mapping entry" in one real run).
+        !name.endsWith(".__openrouter.png")
+    );
 }

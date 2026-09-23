@@ -9,8 +9,9 @@ import {
   startSync,
   incrementSyncProgress,
   finishSync,
-  isSyncRunning,
+  claimSyncRun,
   isStopRequested,
+  requestStop,
   addRecentSyncItem,
 } from "@/lib/syncState";
 import { refreshNameIndex } from "@/lib/nameIndex";
@@ -127,6 +128,32 @@ async function processFile(poolName: string): Promise<boolean> {
     incrementSyncProgress(true, record.size_bytes);
     return true;
   } catch (err) {
+    const status = (err as { status?: number })?.status;
+    if (status === 402) {
+      // OpenRouter's spending-limit-reached error. Not a problem with this
+      // particular file — every other in-flight/queued file in this batch
+      // will fail the exact same way, so continuing would just mark a
+      // potentially large batch of perfectly fine files "failed" for no
+      // real reason. Stop the whole run instead (same mechanism as the
+      // Stop button) and leave this file, and everything still queued,
+      // unprocessed — a plain Sync Now naturally retries all of them once
+      // the limit is raised or credit is added, no separate "retry failed"
+      // step needed. Deliberately no Firestore write here for that reason.
+      console.error(
+        `[sync] OpenRouter spending limit reached while processing "${poolName}" — stopping the sync run. ` +
+          `Raise the key's limit or add credit, then press Sync Now again to pick up where this left off.`
+      );
+      requestStop();
+      addRecentSyncItem({
+        name: poolName,
+        status: "failed",
+        sizeBytes: record.size_bytes,
+        at: new Date().toISOString(),
+      });
+      incrementSyncProgress(false, 0);
+      return false;
+    }
+
     console.error(`[sync] failed to process "${poolName}":`, err);
     await filesCollection.doc(poolName).set({
       pool_name: poolName,
@@ -182,7 +209,10 @@ export async function planSync(retryFailed: boolean): Promise<SyncPlan> {
 // to Firestore, so it's picked back up automatically as "unprocessed" the
 // next time Sync Now runs — no separate resume bookkeeping needed.
 export async function runSyncInBackground(retryFailed: boolean): Promise<void> {
-  if (isSyncRunning()) return;
+  // Claiming the run must happen synchronously, before any await — see
+  // claimSyncRun()'s comment in lib/syncState.ts for why a separate
+  // isSyncRunning() check here was a real, confirmed race.
+  if (!claimSyncRun()) return;
 
   const { toProcess, remainingAfterThisRun } = await planSync(retryFailed);
   startSync(toProcess.length);
