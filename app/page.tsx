@@ -16,32 +16,27 @@ interface SearchResult {
 const ORG_NAME = process.env.NEXT_PUBLIC_ORG_NAME || "";
 const PAGE_TITLE = ORG_NAME ? `${ORG_NAME} File Search` : "File Search";
 
-type SearchMode = "name" | "keyword" | "content";
-
-const SEARCH_MODES: { value: SearchMode; label: string; hint: string }[] = [
-  { value: "name", label: "Name", hint: "Instant — matches file names" },
-  { value: "keyword", label: "Keyword", hint: "Fast — matches extracted keywords" },
-  { value: "content", label: "Smart (AI)", hint: "Slower — understands vague descriptions" },
-];
+const PAGE_SIZE = 10;
 
 export default function Home() {
   const [query, setQuery] = useState("");
-  const [mode, setMode] = useState<SearchMode>("name");
   const [results, setResults] = useState<SearchResult[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [copiedPath, setCopiedPath] = useState<string | null>(null);
+  const [page, setPage] = useState(0);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const runSearch = useCallback(async (q: string, searchMode: SearchMode) => {
+  const runSearch = useCallback(async (q: string) => {
     if (!q.trim()) {
       setResults(null);
       return;
     }
     setLoading(true);
     try {
-      const res = await fetch(`/api/search?q=${encodeURIComponent(q)}&mode=${searchMode}`);
+      const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
       const data = await res.json();
       setResults(data);
+      setPage(0);
     } finally {
       setLoading(false);
     }
@@ -50,19 +45,13 @@ export default function Home() {
   const onQueryChange = (value: string) => {
     setQuery(value);
     if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => runSearch(value, mode), 300);
-  };
-
-  const onModeChange = (value: SearchMode) => {
-    setMode(value);
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    if (query.trim()) runSearch(query, value);
+    debounceRef.current = setTimeout(() => runSearch(value), 300);
   };
 
   const onEnter = (e: React.KeyboardEvent) => {
     if (e.key === "Enter") {
       if (debounceRef.current) clearTimeout(debounceRef.current);
-      runSearch(query, mode);
+      runSearch(query);
     }
   };
 
@@ -77,6 +66,9 @@ export default function Home() {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
   }, []);
+
+  const totalPages = results ? Math.max(1, Math.ceil(results.length / PAGE_SIZE)) : 0;
+  const pageResults = results ? results.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE) : [];
 
   return (
     <div className="flex flex-col flex-1 items-center bg-zinc-50 font-sans dark:bg-black">
@@ -108,91 +100,159 @@ export default function Home() {
           className="w-full rounded-xl border border-zinc-300 bg-white px-4 py-3 text-base text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-50"
         />
 
-        <div className="flex flex-wrap gap-2">
-          {SEARCH_MODES.map((m) => (
-            <button
-              key={m.value}
-              onClick={() => onModeChange(m.value)}
-              title={m.hint}
-              className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
-                mode === m.value
-                  ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
-                  : "bg-zinc-100 text-zinc-600 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
-              }`}
-            >
-              {m.label}
-            </button>
-          ))}
-        </div>
+        {loading && <p className="text-sm text-zinc-500">Searching...</p>}
 
-        <div className="flex flex-col gap-3">
-          {loading && <p className="text-sm text-zinc-500">Searching...</p>}
+        {!loading && results !== null && results.length === 0 && (
+          <p className="text-sm text-zinc-500">No results found.</p>
+        )}
 
-          {!loading && results !== null && results.length === 0 && (
-            <p className="text-sm text-zinc-500">No results found.</p>
-          )}
+        {!loading && results === null && (
+          <p className="text-sm text-zinc-500">Type to search files in the pool.</p>
+        )}
 
-          {!loading && results === null && (
-            <p className="text-sm text-zinc-500">Type to search files in the pool.</p>
-          )}
+        {!loading && results !== null && results.length > 0 && (
+          <>
+            <p className="text-sm text-zinc-500">
+              {results.length} result{results.length === 1 ? "" : "s"}
+              {totalPages > 1 ? ` — page ${page + 1} of ${totalPages}` : ""}
+            </p>
 
-          {!loading &&
-            results?.map((r) => (
-              <div
-                key={r.pool_name}
-                className="flex flex-col gap-2 rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900"
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <a
-                    href={`/api/file?name=${encodeURIComponent(r.pool_name)}`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="font-medium text-zinc-900 hover:underline dark:text-zinc-50"
-                  >
-                    {r.original_name}
-                  </a>
-                  <span className="shrink-0 rounded-full bg-zinc-100 px-2 py-0.5 text-xs text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
-                    {r.file_type}
-                  </span>
-                </div>
-
-                <div className="flex items-center gap-2">
-                  <code className="truncate text-xs text-zinc-500 dark:text-zinc-400">{r.original_path}</code>
-                  <button
-                    onClick={() => copyPath(r.original_path)}
-                    className="shrink-0 text-xs text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
-                  >
-                    {copiedPath === r.original_path ? "Copied!" : "Copy path"}
-                  </button>
-                </div>
-
-                <p className="line-clamp-2 text-sm text-zinc-600 dark:text-zinc-400">{r.summary}</p>
-
-                <div className="flex items-center gap-3">
-                  {(r.file_type === "doc") && (
+            {/* Fixed-height box: the result list scrolls inside itself, not
+                the page. Pagination below gives direct access to any page
+                instead of relying on scrolling through everything. */}
+            <div className="flex min-h-[520px] flex-col gap-3">
+              {pageResults.map((r) => (
+                <div
+                  key={r.pool_name}
+                  className="flex flex-col gap-2 rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900"
+                >
+                  <div className="flex items-start justify-between gap-3">
                     <a
-                      href={`/api/file?name=${encodeURIComponent(r.pool_name)}&download=1`}
-                      className="text-xs text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+                      href={`/api/file?name=${encodeURIComponent(r.pool_name)}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="font-medium text-zinc-900 hover:underline dark:text-zinc-50"
                     >
-                      Download original
+                      {r.original_name}
                     </a>
-                  )}
-                </div>
-
-                <div className="flex gap-1">
-                  {r.matched_on.map((m) => (
-                    <span
-                      key={m}
-                      className="rounded-full bg-blue-50 px-2 py-0.5 text-xs text-blue-700 dark:bg-blue-950 dark:text-blue-300"
-                    >
-                      {m} match
+                    <span className="shrink-0 rounded-full bg-zinc-100 px-2 py-0.5 text-xs text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
+                      {r.file_type}
                     </span>
-                  ))}
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <code className="truncate text-xs text-zinc-500 dark:text-zinc-400">{r.original_path}</code>
+                    <button
+                      onClick={() => copyPath(r.original_path)}
+                      className="shrink-0 text-xs text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+                    >
+                      {copiedPath === r.original_path ? "Copied!" : "Copy path"}
+                    </button>
+                  </div>
+
+                  <p className="line-clamp-2 text-sm text-zinc-600 dark:text-zinc-400">{r.summary}</p>
+
+                  <div className="flex items-center gap-3">
+                    {r.file_type === "doc" && (
+                      <a
+                        href={`/api/file?name=${encodeURIComponent(r.pool_name)}&download=1`}
+                        className="text-xs text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+                      >
+                        Download original
+                      </a>
+                    )}
+                  </div>
+
+                  <div className="flex gap-1">
+                    {r.matched_on.map((m) => (
+                      <span
+                        key={m}
+                        className="rounded-full bg-blue-50 px-2 py-0.5 text-xs text-blue-700 dark:bg-blue-950 dark:text-blue-300"
+                      >
+                        {m} match
+                      </span>
+                    ))}
+                  </div>
                 </div>
-              </div>
-            ))}
-        </div>
+              ))}
+            </div>
+
+            {totalPages > 1 && (
+              <PageControls page={page} totalPages={totalPages} onChange={setPage} />
+            )}
+          </>
+        )}
       </main>
     </div>
   );
+}
+
+function PageControls({
+  page,
+  totalPages,
+  onChange,
+}: {
+  page: number;
+  totalPages: number;
+  onChange: (page: number) => void;
+}) {
+  // Direct access to any page, not just prev/next: a short run shows every
+  // page number; a long run shows the ends plus a window around the current
+  // page, so this stays usable even with many pages of results.
+  const pageNumbers = buildPageWindow(page, totalPages);
+
+  return (
+    <div className="flex flex-wrap items-center justify-center gap-1 pt-2">
+      <button
+        onClick={() => onChange(Math.max(0, page - 1))}
+        disabled={page === 0}
+        className="rounded-lg px-3 py-1.5 text-sm font-medium text-zinc-600 hover:bg-zinc-100 disabled:opacity-40 disabled:hover:bg-transparent dark:text-zinc-300 dark:hover:bg-zinc-800"
+      >
+        Prev
+      </button>
+      {pageNumbers.map((n, i) =>
+        n === null ? (
+          <span key={`ellipsis-${i}`} className="px-1 text-sm text-zinc-400">
+            …
+          </span>
+        ) : (
+          <button
+            key={n}
+            onClick={() => onChange(n)}
+            className={`rounded-lg px-3 py-1.5 text-sm font-medium transition-colors ${
+              n === page
+                ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
+                : "text-zinc-600 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800"
+            }`}
+          >
+            {n + 1}
+          </button>
+        )
+      )}
+      <button
+        onClick={() => onChange(Math.min(totalPages - 1, page + 1))}
+        disabled={page === totalPages - 1}
+        className="rounded-lg px-3 py-1.5 text-sm font-medium text-zinc-600 hover:bg-zinc-100 disabled:opacity-40 disabled:hover:bg-transparent dark:text-zinc-300 dark:hover:bg-zinc-800"
+      >
+        Next
+      </button>
+    </div>
+  );
+}
+
+function buildPageWindow(page: number, totalPages: number): (number | null)[] {
+  const windowSize = 1;
+  const pages = new Set<number>([0, totalPages - 1, page]);
+  for (let d = 1; d <= windowSize; d++) {
+    if (page - d >= 0) pages.add(page - d);
+    if (page + d < totalPages) pages.add(page + d);
+  }
+  const sorted = [...pages].sort((a, b) => a - b);
+
+  const result: (number | null)[] = [];
+  for (let i = 0; i < sorted.length; i++) {
+    if (i > 0 && sorted[i] - sorted[i - 1] > 1) result.push(null);
+    result.push(sorted[i]);
+  }
+  return result;
 }

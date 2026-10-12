@@ -1,17 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { search, SEARCH_MODES, type SearchMode } from "@/lib/search";
-
-function parseMode(raw: string | null): SearchMode {
-  return SEARCH_MODES.includes(raw as SearchMode) ? (raw as SearchMode) : "name";
-}
+import { search } from "@/lib/search";
 
 export async function GET(request: NextRequest) {
   const q = request.nextUrl.searchParams.get("q")?.trim() ?? "";
-  const mode = parseMode(request.nextUrl.searchParams.get("mode"));
   if (!q) return NextResponse.json([]);
 
   try {
-    const results = await search(q, mode);
+    const results = await search(q);
     return NextResponse.json(results);
   } catch (err) {
     console.error("SEARCH ERROR:", err);

@@ -1,13 +1,14 @@
 import { filesCollection } from "@/lib/firestore";
 import { FieldPath } from "@google-cloud/firestore";
-import { getNameIndex, type NameIndexEntry } from "@/lib/nameIndex";
+import { getNameIndex } from "@/lib/nameIndex";
 import { tokenise } from "@/lib/gemini";
 import { searchContent as vertexSearchContent } from "@/lib/vertexSearch";
 
-export type SearchMode = "name" | "keyword" | "content";
-export const SEARCH_MODES: SearchMode[] = ["name", "keyword", "content"];
-
-const TOP_N = 20;
+// Enough candidates for several pages of results client-side, while staying
+// cheap: ranking itself is in-memory, and fetching full docs for this many
+// IDs is a handful of chunked Firestore "in" queries (capped at 30 each).
+const RESULT_LIMIT = 100;
+const FIRESTORE_IN_LIMIT = 30; // Firestore "in" operator caps at 30 values
 
 const STOPWORDS = new Set([
   "the", "a", "an", "of", "for", "and", "or", "to", "in", "on", "with", "is", "are", "was", "were",
@@ -90,40 +91,6 @@ function queryTokens(query: string): string[] {
   return tokenise(query).filter((t) => !STOPWORDS.has(t));
 }
 
-// Name search: scored from the lightweight in-memory index (instant, no
-// network round-trip), then one Firestore fetch for full data on the top
-// candidates only.
-async function searchByName(query: string): Promise<SearchResult[]> {
-  const index = await getNameIndex();
-
-  const scored = index
-    .map((entry) => ({ id: entry.id, score: scoreNameMatch(query, entry.original_name) }))
-    .filter((entry) => entry.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 30); // Firestore "in" operator caps at 30 values
-
-  if (scored.length === 0) return [];
-
-  const docs = await filesCollection.where(FieldPath.documentId(), "in", scored.map((e) => e.id)).get();
-  const docById = new Map(docs.docs.map((d) => [d.id, d.data()]));
-
-  const results: SearchResult[] = [];
-  for (const { id, score } of scored) {
-    const data = docById.get(id);
-    if (!data || data.status !== "done") continue;
-    results.push({
-      pool_name: data.pool_name,
-      original_name: data.original_name,
-      original_path: data.original_path,
-      summary: data.summary ?? "",
-      file_type: data.file_type,
-      score,
-      matched_on: ["name"],
-    });
-  }
-  return results.slice(0, TOP_N);
-}
-
 // A query token counts as matching a keyword if either contains the other —
 // this is what makes "denser" find a stored keyword like "denserai" (a
 // compound word/brand name Gemini wrote as one token, no space to split on).
@@ -181,26 +148,110 @@ function keywordEntryScore(tokens: string[], keywords: string[], summary: string
   return scoreSum / tokens.length;
 }
 
-async function searchByKeyword(query: string): Promise<SearchResult[]> {
-  const tokens = queryTokens(query);
-  if (tokens.length === 0) return [];
+interface Candidate {
+  id: string;
+  nameScore: number;
+  keywordScore: number;
+  contentScore: number;
+  // Present only for a hit that came from Vertex and isn't already in the
+  // name/keyword candidate set — Vertex's structData carries everything
+  // needed to render the result, so this skips a redundant Firestore fetch.
+  vertexData?: { pool_name: string; original_name: string; original_path: string; summary: string; file_type: string };
+}
 
-  const index: NameIndexEntry[] = await getNameIndex();
+// File name match is the single highest-priority signal — a user typing
+// (part of) the actual file name should always see it first, ahead of any
+// keyword/semantic match no matter how strong. Adding a large fixed tier
+// (rather than just weighting name higher) makes this a hard guarantee, not
+// a tendency that a strong enough keyword/content score could still beat.
+const NAME_MATCH_TIER = 1000;
 
-  const scored = index
-    .map((entry) => ({ id: entry.id, score: keywordEntryScore(tokens, entry.keywords, entry.summary) }))
-    .filter((entry) => entry.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 30); // Firestore "in" operator caps at 30 values
+// Below the name tier, keyword and semantic (AI) matches are merged into one
+// combined relevance score rather than kept as separate modes/tiers — a
+// file that both of them agree on is more likely to be the right one than a
+// file either signal alone picked, so agreement is rewarded with a bonus on
+// top of the stronger of the two signals.
+const AGREEMENT_BONUS_WEIGHT = 0.3;
 
-  if (scored.length === 0) return [];
+function combineScore(c: Candidate): number {
+  if (c.nameScore > 0) return NAME_MATCH_TIER + c.nameScore;
+  const base = Math.max(c.keywordScore, c.contentScore);
+  const agreementBonus = Math.min(c.keywordScore, c.contentScore) * AGREEMENT_BONUS_WEIGHT;
+  return base + agreementBonus;
+}
 
-  const docs = await filesCollection.where(FieldPath.documentId(), "in", scored.map((e) => e.id)).get();
-  const docById = new Map(docs.docs.map((d) => [d.id, d.data()]));
+// Single, unopinionated search: the caller never chooses a mode. Name,
+// keyword, and AI/semantic (Vertex) signals are all gathered for the same
+// query and merged into one ranked list, in-process, before anything is
+// returned — see combineScore for the priority rule.
+export async function search(query: string): Promise<SearchResult[]> {
+  const q = query.trim();
+  if (!q) return [];
+
+  const index = await getNameIndex();
+  const tokens = queryTokens(q);
+
+  const candidates = new Map<string, Candidate>();
+  for (const entry of index) {
+    const nameScore = scoreNameMatch(q, entry.original_name);
+    const keywordScore = tokens.length > 0 ? keywordEntryScore(tokens, entry.keywords, entry.summary) : 0;
+    if (nameScore > 0 || keywordScore > 0) {
+      candidates.set(entry.id, { id: entry.id, nameScore, keywordScore, contentScore: 0 });
+    }
+  }
+
+  // Vertex AI Search must never take the whole search down — e.g. its
+  // billing account being temporarily disabled (seen live in production)
+  // should degrade to name+keyword results only, not fail every search.
+  let contentResults: Awaited<ReturnType<typeof vertexSearchContent>> = [];
+  try {
+    contentResults = await vertexSearchContent(q, RESULT_LIMIT);
+  } catch (err) {
+    console.error("[search] Vertex content search failed, continuing with name/keyword results only:", err);
+  }
+
+  for (const r of contentResults) {
+    if (!r.pool_name) continue;
+    const existing = candidates.get(r.pool_name);
+    if (existing) {
+      existing.contentScore = r.score;
+    } else {
+      candidates.set(r.pool_name, { id: r.pool_name, nameScore: 0, keywordScore: 0, contentScore: r.score, vertexData: r });
+    }
+  }
+
+  const ranked = [...candidates.values()]
+    .map((c) => ({ ...c, finalScore: combineScore(c) }))
+    .sort((a, b) => b.finalScore - a.finalScore)
+    .slice(0, RESULT_LIMIT);
+
+  if (ranked.length === 0) return [];
+
+  // Firestore is the source of truth for status/current data — fetch full
+  // docs for every candidate that came from the name/keyword index. Vertex-
+  // only hits already carry full structData and are indexed==done by
+  // construction (only "done" files are ever imported), so they skip this.
+  const needsFetch = ranked.filter((c) => !c.vertexData).map((c) => c.id);
+  const docById = new Map<string, FirebaseFirestore.DocumentData>();
+  for (let i = 0; i < needsFetch.length; i += FIRESTORE_IN_LIMIT) {
+    const chunk = needsFetch.slice(i, i + FIRESTORE_IN_LIMIT);
+    const docs = await filesCollection.where(FieldPath.documentId(), "in", chunk).get();
+    for (const d of docs.docs) docById.set(d.id, d.data()!);
+  }
 
   const results: SearchResult[] = [];
-  for (const { id, score } of scored) {
-    const data = docById.get(id);
+  for (const c of ranked) {
+    const matchedOn: string[] = [];
+    if (c.nameScore > 0) matchedOn.push("name");
+    if (c.keywordScore > 0) matchedOn.push("keyword");
+    if (c.contentScore > 0) matchedOn.push("content");
+
+    if (c.vertexData) {
+      results.push({ ...c.vertexData, score: c.finalScore, matched_on: matchedOn });
+      continue;
+    }
+
+    const data = docById.get(c.id);
     if (!data || data.status !== "done") continue;
     results.push({
       pool_name: data.pool_name,
@@ -208,28 +259,9 @@ async function searchByKeyword(query: string): Promise<SearchResult[]> {
       original_path: data.original_path,
       summary: data.summary ?? "",
       file_type: data.file_type,
-      score,
-      matched_on: ["keyword"],
+      score: c.finalScore,
+      matched_on: matchedOn,
     });
   }
-  return results.slice(0, TOP_N);
-}
-
-// Content search: Vertex AI Search (Discovery Engine). Uses a real ANN
-// index server-side, so this stays fast even at large document counts —
-// unlike Firestore's flat (linear-scan) vector index, which slows down
-// roughly linearly with document count.
-async function searchByContent(query: string): Promise<SearchResult[]> {
-  const results = await vertexSearchContent(query, TOP_N);
-  return results
-    .filter((r) => r.pool_name)
-    .map((r) => ({ ...r, matched_on: ["content"] }))
-    .sort((a, b) => b.score - a.score);
-}
-
-export async function search(query: string, mode: SearchMode): Promise<SearchResult[]> {
-  if (!query.trim()) return [];
-  if (mode === "keyword") return searchByKeyword(query);
-  if (mode === "content") return searchByContent(query);
-  return searchByName(query);
+  return results;
 }

@@ -151,12 +151,16 @@ async function callGeminiWithRetry(parts: Array<Record<string, unknown>>): Promi
   throw lastError;
 }
 
-function fallbackSummary(originalName: string, originalPath: string): SummaryResult {
-  const tokens = tokenise(`${originalName} ${originalPath}`);
-  return {
-    summary: `File "${originalName}" located at ${originalPath}. Content was not read (unsupported file type).`,
-    keywords: [...new Set(tokens)].slice(0, 20),
-  };
+// Was a fabricated "done" summary with no real content — got marked done,
+// ticked, and imported into Vertex AI Search anyway, burning a real slot in
+// a hard-capped per-project document quota (confirmed scarce: Nyati alone
+// hit the 200,000-document ceiling) for a record with zero searchable
+// value, while looking like a success in the UI. Throwing instead lets
+// these end up correctly marked "failed" — visible for manual follow-up,
+// nothing wasted on Vertex, easy to find and retry later once support for
+// that case (e.g. opening zip archives) actually exists.
+function unsupportedFileError(reason: string): Error {
+  return new Error(`Not summarised: ${reason}`);
 }
 
 export function tokenise(text: string): string[] {
@@ -266,7 +270,7 @@ export async function summariseFile(
   const ext = path.extname(originalName).toLowerCase();
 
   if (fileClass === "other") {
-    return fallbackSummary(originalName, originalPath);
+    throw unsupportedFileError(`unsupported file type "${ext || "(no extension)"}"`);
   }
 
   const stat = fs.statSync(filePath);
@@ -278,7 +282,7 @@ export async function summariseFile(
     let bytes: Buffer = fs.readFileSync(filePath);
     if (bytes.length > MAX_PDF_BYTES) {
       const trimmed = await trimPdfForInline(bytes);
-      if (!trimmed) return fallbackSummary(originalName, originalPath); // genuinely pathological file
+      if (!trimmed) throw unsupportedFileError("PDF could not be trimmed to fit the size limit (corrupt or pathological structure)");
       bytes = trimmed;
     }
     return callGeminiWithRetry([
@@ -291,10 +295,10 @@ export async function summariseFile(
     // No practical way to "trim" an image the way a PDF's pages can be cut
     // down — 90MB is already far beyond any realistic site photo or scan,
     // so a file exceeding it is either corrupt or an unusual raw/TIFF export.
-    if (stat.size > MAX_IMAGE_BYTES) return fallbackSummary(originalName, originalPath);
+    if (stat.size > MAX_IMAGE_BYTES) throw unsupportedFileError(`image exceeds the ${MAX_IMAGE_BYTES}-byte limit`);
     const original = fs.readFileSync(filePath);
     const png = await normaliseImageToPng(original);
-    if (!png) return fallbackSummary(originalName, originalPath); // genuinely unreadable/corrupt image
+    if (!png) throw unsupportedFileError("image could not be read/normalised (corrupt or unsupported format)");
     if (usingOpenRouter()) {
       // Write the normalized PNG next to the source so summariseViaOpenRouter
       // can read it the same way it reads a rasterized PDF page — avoids a
@@ -333,7 +337,7 @@ export async function summariseFile(
 
   // office
   const raw = (await extractOfficeText(filePath, ext)).slice(0, MAX_TEXT_CHARS);
-  if (!raw.trim()) return fallbackSummary(originalName, originalPath);
+  if (!raw.trim()) throw unsupportedFileError("no extractable text found in office document (empty or corrupt)");
   if (usingOpenRouter()) return summariseTextViaOpenRouter(raw);
   return callGeminiWithRetry([{ text: `${PROMPT}\n\nFILE CONTENT:\n${raw}` }]);
 }

@@ -28,7 +28,11 @@ import { Worker } from "worker_threads";
 //    (resolve or reject), so callers (syncEngine's per-file try/catch)
 //    always get a clean answer instead of hanging indefinitely.
 
-const SYNC_CONCURRENCY = 16;
+// Was hardcoded to 16 here, independent of syncEngine.ts's own
+// SYNC_CONCURRENCY — meaning tuning that env var down (e.g. for a network
+// that can't sustain many simultaneous connections) silently had no effect
+// on render-pool sizing at all. Reading the same env var keeps both in sync.
+const SYNC_CONCURRENCY = Number(process.env.SYNC_CONCURRENCY) || 16;
 const DEFAULT_POOL_SIZE = Math.max(2, Math.min(SYNC_CONCURRENCY, os.cpus().length - 1));
 const POOL_SIZE = Number(process.env.RENDER_POOL_SIZE) || DEFAULT_POOL_SIZE;
 const WORKER_PATH = path.join(process.cwd(), "workers", "pdfRenderWorker.mjs");
@@ -43,7 +47,13 @@ const WORKER_PATH = path.join(process.cwd(), "workers", "pdfRenderWorker.mjs");
 // 90s without anything being wrong with the file. Raised to give real
 // files enough room; a truly pathological file still gets cut loose
 // eventually rather than hanging forever.
-const RENDER_TIMEOUT_MS = 180_000;
+//
+// That tradeoff (wait longer, rescue more real files) isn't universal,
+// though — a different site can reasonably prefer the opposite: fail fast
+// on a slow file and move on, accepting that file won't get summarised,
+// rather than have the whole batch stall waiting it out. Configurable per
+// deployment instead of hardcoding one answer for every site.
+const RENDER_TIMEOUT_MS = Number(process.env.RENDER_TIMEOUT_MS) || 180_000;
 
 interface RenderResult {
   totalPages: number;
