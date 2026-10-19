@@ -112,12 +112,15 @@ const MIN_SUBSTRING_MATCH_LEN = 4;
 // hit scores full credit; a plain substring hit in the summary text (a
 // looser, uncurated signal) scores partial credit as a fallback.
 const SUMMARY_MATCH_WEIGHT = 0.6;
-// Last-resort tier: a typo in the query itself (name search already forgives
-// these; keyword search didn't). Only tried against the keywords array — it's
-// small and bounded per doc (~20-60 short entries), so this stays cheap even
-// at tens of thousands of documents, unlike fuzzy-matching arbitrary summary
-// text would be.
-const FUZZY_MATCH_WEIGHT = 0.5;
+// Was also a last-resort fuzzy (typo-forgiving) fallback here, tried against
+// every keyword of every document for every query token whenever the
+// cheaper checks above missed — which, across a realistic multi-word query,
+// is most documents. At Mantri's ~25k-document scale that was cheap enough
+// to not notice; at Nyati's ~225k documents, confirmed live, that exact path
+// was the entire cause of searches taking 75-100+ seconds (a few seconds
+// once removed). Dropped rather than reworked: the AI/semantic (Vertex)
+// signal already tolerates typos and paraphrasing via embeddings, so this
+// tier's unique recall value was small relative to what it cost at scale.
 
 function keywordEntryScore(tokens: string[], keywords: string[], summary: string): number {
   if (tokens.length === 0) return 0;
@@ -140,10 +143,7 @@ function keywordEntryScore(tokens: string[], keywords: string[], summary: string
     }
     if (t.length >= MIN_SUBSTRING_MATCH_LEN && summaryLower.includes(t)) {
       scoreSum += SUMMARY_MATCH_WEIGHT;
-      continue;
     }
-    const fuzzyHit = t.length >= MIN_SUBSTRING_MATCH_LEN && keywords.some((k) => isFuzzyMatch(t, k));
-    if (fuzzyHit) scoreSum += FUZZY_MATCH_WEIGHT;
   }
   return scoreSum / tokens.length;
 }

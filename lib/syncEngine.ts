@@ -132,7 +132,7 @@ async function processFile(poolName: string): Promise<boolean> {
     // reindexPendingVertexDocs() retries exactly this case cheaply, without
     // re-summarizing, at the start of every future sync run.
     try {
-      await importRecords([
+      const outcome = await importRecords([
         {
           pool_name: poolName,
           original_name: record.original_name,
@@ -143,7 +143,7 @@ async function processFile(poolName: string): Promise<boolean> {
           keywords,
         },
       ]);
-      await filesCollection.doc(poolName).update({ vertex_indexed: true });
+      await filesCollection.doc(poolName).update({ vertex_indexed: true, vertex_shard: outcome.shard });
     } catch (vertexErr) {
       console.error(
         `[sync] summarized "${poolName}" but Vertex AI Search import failed — will retry the import only (no re-summarizing) on the next sync run:`,
@@ -262,7 +262,7 @@ async function reindexPendingVertexDocs(): Promise<void> {
   for (let i = 0; i < pending.length; i += REINDEX_CHUNK_SIZE) {
     const chunk = pending.slice(i, i + REINDEX_CHUNK_SIZE);
     try {
-      await importRecords(
+      const outcome = await importRecords(
         chunk.map((doc) => ({
           pool_name: doc.id,
           original_name: doc.original_name,
@@ -273,7 +273,9 @@ async function reindexPendingVertexDocs(): Promise<void> {
           keywords: doc.keywords,
         }))
       );
-      await Promise.all(chunk.map((doc) => filesCollection.doc(doc.id).update({ vertex_indexed: true })));
+      await Promise.all(
+        chunk.map((doc) => filesCollection.doc(doc.id).update({ vertex_indexed: true, vertex_shard: outcome.shard }))
+      );
     } catch (err) {
       console.error(`[sync] retry of a ${chunk.length}-file Vertex AI Search import batch still failing — will retry again next sync run:`, err);
     }

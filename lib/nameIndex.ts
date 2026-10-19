@@ -12,6 +12,15 @@ export interface NameIndexEntry {
 }
 
 let cache: NameIndexEntry[] | null = null;
+// Tracks a load already in flight so concurrent callers share it instead of
+// each starting their own full Firestore scan — every search now needs this
+// index (unlike before, when only name/keyword mode did), so several
+// searches landing close together on a cold cache used to each kick off
+// their own multi-second full-collection fetch, compounding into search
+// requests taking 70+ seconds apiece. Seen live on Mantri: a user typing
+// "iceberg" fired 5+ overlapping searches, each racing to reload the same
+// ~26,000-doc index from scratch.
+let loading: Promise<NameIndexEntry[]> | null = null;
 
 async function load(): Promise<NameIndexEntry[]> {
   const snap = await filesCollection.select("original_name", "pool_name", "keywords", "summary").get();
@@ -25,8 +34,18 @@ async function load(): Promise<NameIndexEntry[]> {
 }
 
 export async function getNameIndex(): Promise<NameIndexEntry[]> {
-  if (!cache) cache = await load();
-  return cache;
+  if (cache) return cache;
+  if (!loading) {
+    loading = load()
+      .then((data) => {
+        cache = data;
+        return data;
+      })
+      .finally(() => {
+        loading = null;
+      });
+  }
+  return loading;
 }
 
 export async function refreshNameIndex(): Promise<void> {
