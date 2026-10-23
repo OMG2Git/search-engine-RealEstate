@@ -314,15 +314,27 @@ export async function runSyncInBackground(retryFailed: boolean): Promise<void> {
   // isSyncRunning() check here was a real, confirmed race.
   if (!claimSyncRun()) return;
 
-  await reindexPendingVertexDocs();
+  try {
+    await reindexPendingVertexDocs();
 
-  const { toProcess, remainingAfterThisRun } = await planSync(retryFailed);
-  startSync(toProcess.length);
+    const { toProcess, remainingAfterThisRun } = await planSync(retryFailed);
+    startSync(toProcess.length);
 
-  const limit = pLimit(CONCURRENCY);
-  const results = await Promise.all(toProcess.map((name) => limit(() => processFile(name))));
-  const skippedByStop = results.filter((attempted) => !attempted).length;
+    const limit = pLimit(CONCURRENCY);
+    const results = await Promise.all(toProcess.map((name) => limit(() => processFile(name))));
+    const skippedByStop = results.filter((attempted) => !attempted).length;
 
-  finishSync(remainingAfterThisRun + skippedByStop);
-  await refreshNameIndex();
+    finishSync(remainingAfterThisRun + skippedByStop);
+    await refreshNameIndex();
+  } catch (err) {
+    // The "a sync is running" flag lives only in memory with no try/finally
+    // guaranteeing it clears — confirmed live on Nyati: one run hit an
+    // unexpected error here, finishSync() never ran, and every scheduled
+    // trigger for the next 65+ hours silently claimed a sync was already in
+    // progress and did nothing, with zero files processed and zero errors
+    // surfaced anywhere. Catching here guarantees the lock always releases,
+    // and logs the real error so a future recurrence is actually visible.
+    console.error("[sync] runSyncInBackground failed unexpectedly — releasing the sync lock so the next trigger can retry:", err);
+    finishSync(0);
+  }
 }
